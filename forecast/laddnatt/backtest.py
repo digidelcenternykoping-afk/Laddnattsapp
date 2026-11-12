@@ -57,8 +57,12 @@ def evaluate_nights(prices: pd.DataFrame, pred: pd.DataFrame) -> pd.DataFrame:
 
 
 def run_backtest(prices: pd.DataFrame, weather: pd.DataFrame, test_days: int = 365,
-                 folds: int = 4, max_iter: int = 300) -> tuple[pd.DataFrame, pd.DataFrame]:
-    data = build_training(prices, weather)
+                 folds: int = 4, max_iter: int = 300,
+                 fc_weather: pd.DataFrame | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    data = build_training(prices, weather, fc_weather)
+    # Bara dagar där alla sex dagar framåt finns, så att alla sju nätter kan jämföras.
+    full = data.groupby("origin")["lead"].nunique()
+    data = data[data["origin"].isin(full[full == 6].index)]
     origins = sorted(data["origin"].unique())
     test_origins = origins[-test_days:]
     preds = []
@@ -75,7 +79,9 @@ def run_backtest(prices: pd.DataFrame, weather: pd.DataFrame, test_days: int = 3
     return pred, evaluate_nights(prices, pred)
 
 
-def report(pred: pd.DataFrame, nights: pd.DataFrame) -> str:
+def report(pred: pd.DataFrame, nights: pd.DataFrame, title: str = "Test mot historik",
+           note: str = "Obs: testet använder uppmätt väder i stället för de väderprognoser som fanns då. "
+                       "Verklig träffsäkerhet blir därför något sämre, särskilt 4-6 dagar framåt.") -> str:
     m = nights[["ikvall", "slump", "samma_som_idag", "modell", "facit"]].mean()
     span = m["slump"] - m["facit"]
     captured = (m["slump"] - m["modell"]) / span if span > 0 else float("nan")
@@ -83,7 +89,7 @@ def report(pred: pd.DataFrame, nights: pd.DataFrame) -> str:
     err = (pred["p50"] - pred["price"]).abs().groupby(pred["lead"]).mean()
     cover = ((pred["price"] >= pred["p10"]) & (pred["price"] <= pred["p90"])).mean()
     lines = [
-        "# Test mot historik",
+        f"# {title}",
         "",
         f"Period: {nights['date'].min()} till {nights['date'].max()} ({len(nights)} dagar).",
         "Priser i SEK/kWh exklusive moms och avgifter, billigaste 3 timmarna per natt.",
@@ -106,8 +112,7 @@ def report(pred: pd.DataFrame, nights: pd.DataFrame) -> str:
         "",
         f"Andel timmar där priset hamnade inom intervallet p10-p90: {cover:.0%} (målet är 80 %).",
         "",
-        "Obs: testet använder uppmätt väder i stället för de väderprognoser som fanns då. "
-        "Verklig träffsäkerhet blir därför något sämre, särskilt 4-6 dagar framåt.",
+        note,
     ]
     return "\n".join(lines) + "\n"
 
@@ -121,6 +126,16 @@ def main() -> None:
     weather = sources.update_weather(a.data / "weather.csv")
     pred, nights = run_backtest(prices, weather)
     text = report(pred, nights)
+    try:
+        fc_weather = sources.update_forecast_weather(a.data / "forecast_weather.csv")
+    except Exception as e:  # tjänsten kan vara nere; det ska inte stoppa resten
+        text += f"\nKunde inte hämta arkiverade väderprognoser: {e}\n"
+    else:
+        pred, nights = run_backtest(prices, weather, fc_weather=fc_weather)
+        text += "\n" + report(
+            pred, nights, title="Test med de väderprognoser som fanns då",
+            note="Det här är det ärliga testet: modellen har både tränats och testats med de "
+                 "väderprognoser som fanns 2-7 dagar i förväg (data från februari 2024).")
     a.out.write_text(text, encoding="utf-8")
     print(text)
 

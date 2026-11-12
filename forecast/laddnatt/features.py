@@ -39,9 +39,24 @@ def weather_matrices(weather: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return out
 
 
+def forecast_matrices(fc_weather: pd.DataFrame) -> dict[int, dict[str, pd.DataFrame]]:
+    """Arkiverade väderprognoser -> väder-matriser per lead.
+
+    Körningen sker dagen före last_known, så måldagen last_known+lead ligger
+    lead+1 dagar fram från den väderprognos som fanns då.
+    """
+    return {k - 1: weather_matrices(fc_weather.xs(k, level="days_ahead"))
+            for k in fc_weather.index.get_level_values("days_ahead").unique()}
+
+
 def rows_for_origin(prices: pd.DataFrame, wm: dict[str, pd.DataFrame], last_known: dt.date,
-                    with_target: bool) -> pd.DataFrame | None:
-    """Rader för alla leads och timmar givet att priser är kända t.o.m. last_known."""
+                    with_target: bool,
+                    wm_lead: dict[int, dict[str, pd.DataFrame]] | None = None) -> pd.DataFrame | None:
+    """Rader för alla leads och timmar givet att priser är kända t.o.m. last_known.
+
+    wm är uppmätt väder (används för de senaste dagarna). Om wm_lead anges tas
+    måldagens väder i stället från den prognos som fanns vid tillfället.
+    """
     hist_days = [last_known - dt.timedelta(days=i) for i in range(LEVEL_DAYS)]
     if any(d not in prices.index for d in hist_days) or any(d not in wm["wind"].index for d in hist_days):
         return None
@@ -59,7 +74,8 @@ def rows_for_origin(prices: pd.DataFrame, wm: dict[str, pd.DataFrame], last_know
     frames = []
     for lead in LEADS:
         t = last_known + dt.timedelta(days=lead)
-        if t not in wm["wind"].index:
+        tw = wm if wm_lead is None else wm_lead.get(lead)
+        if tw is None or t not in tw["wind"].index:
             continue
         if with_target and t not in prices.index:
             continue
@@ -76,7 +92,7 @@ def rows_for_origin(prices: pd.DataFrame, wm: dict[str, pd.DataFrame], last_know
         f["level_hour"] = level_hour
         f["last_same_hour"] = ph[0]
         for c in ["wind", "windpow", "temp", *WIND_POINTS]:
-            f[c] = wm[c].loc[t].to_numpy()
+            f[c] = tw[c].loc[t].to_numpy()
         f["windpow_day"] = f["windpow"].mean()
         f["temp_day"] = f["temp"].mean()
         f["windpow_vs_hist"] = f["windpow"] - base["hist_windpow"]
@@ -88,10 +104,12 @@ def rows_for_origin(prices: pd.DataFrame, wm: dict[str, pd.DataFrame], last_know
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
-def build_training(prices: pd.DataFrame, weather: pd.DataFrame) -> pd.DataFrame:
+def build_training(prices: pd.DataFrame, weather: pd.DataFrame,
+                   fc_weather: pd.DataFrame | None = None) -> pd.DataFrame:
     wm = weather_matrices(weather)
+    wm_lead = forecast_matrices(fc_weather) if fc_weather is not None else None
     frames = [r for d in prices.index
-              if (r := rows_for_origin(prices, wm, d, with_target=True)) is not None]
+              if (r := rows_for_origin(prices, wm, d, with_target=True, wm_lead=wm_lead)) is not None]
     return pd.concat(frames, ignore_index=True)
 
 
