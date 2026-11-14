@@ -1,0 +1,56 @@
+name: Bygg app
+
+on:
+  push:
+    branches: [main]
+    paths: ["android/**", ".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HAS_KEY: ${{ secrets.SIGNING_KEYSTORE_B64 != '' }}
+      VERSION_CODE: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.11.1"
+      - name: Hämta signeringsnyckel
+        if: env.HAS_KEY == 'true'
+        env:
+          SIGNING_KEYSTORE_B64: ${{ secrets.SIGNING_KEYSTORE_B64 }}
+        run: |
+          echo "$SIGNING_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/laddnatt.jks"
+          echo "KEYSTORE_FILE=$RUNNER_TEMP/laddnatt.jks" >> "$GITHUB_ENV"
+      - name: Tester och bygge
+        working-directory: android
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: gradle :core:test :app:assembleRelease --console=plain
+      - name: Publicera ny version
+        if: env.HAS_KEY == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp android/app/build/outputs/apk/release/app-release.apk laddnatt.apk
+          gh release create "v$VERSION_CODE" laddnatt.apk \
+            --title "Laddnatt 0.$VERSION_CODE" \
+            --notes "Ladda ner laddnatt.apk på telefonen och öppna filen för att installera."
+      - name: Saknar signeringsnyckel
+        if: env.HAS_KEY != 'true'
+        run: |
+          echo "::warning::Hemligheterna SIGNING_KEYSTORE_B64 och SIGNING_PASSWORD saknas. Ingen version publicerades."

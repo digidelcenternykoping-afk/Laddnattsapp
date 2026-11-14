@@ -63,12 +63,17 @@ def make_forecast(prices: pd.DataFrame, weather: pd.DataFrame, now: dt.datetime,
             "p10": round(float(arr[i:i + CHARGE_HOURS, 0].mean()), 4),
             "p90": round(float(arr[i:i + CHARGE_HOURS, 2].mean()), 4),
         })
+    # Dygnsmedeltemperatur (Stockholm/Göteborg) så att appen kan räkna förbrukning i kyla.
+    temp = weather[list(sources.TEMP_POINTS)].mean(axis=1).groupby(level="date").mean()
+    daily_temp = {d.isoformat(): round(float(t), 1) for d, t in temp.items()
+                  if d >= now.date() - dt.timedelta(days=14)}
     return {
         "area": sources.AREA,
         "unit": "SEK/kWh exkl. moms och avgifter",
         "generated": now.isoformat(timespec="seconds"),
         "prices_known_through": last_known.isoformat(),
         "nights": nights,
+        "daily_temp": daily_temp,
         "hours": hours,
     }
 

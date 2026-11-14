@@ -92,6 +92,7 @@ def test_daily_forecast_json(tmp_path):
     fc = make_forecast(prices, w, now, max_iter=40)
     assert fc["prices_known_through"] == last.isoformat()
     assert len(fc["nights"]) == 7
+    assert now.date().isoformat() in fc["daily_temp"]
     assert fc["nights"][0]["known"] and not fc["nights"][-1]["known"]
     assert fc["nights"][0]["evening"] == (last - dt.timedelta(days=1)).isoformat()
     unknown = [h for h in fc["hours"] if not h["known"]]

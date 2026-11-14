@@ -3,4 +3,10 @@ __pycache__/
 *.pyc
 .venv/
 backtest.md
+android/.gradle/
+android/build/
+android/*/build/
+android/local.properties
+*.jks
+*.keystore
 data/forecast_weather.csv
