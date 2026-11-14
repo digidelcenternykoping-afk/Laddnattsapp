@@ -161,3 +161,59 @@ def load_weather(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
     df["date"] = pd.to_datetime(df["date"]).dt.date
     return df.set_index(["date", "hour"])
+
+
+# ---------------------------------------------------------------- arkiverade väderprognoser
+
+FC_START = dt.date(2024, 2, 1)  # Open-Meteos arkiv över tidigare prognoskörningar börjar i januari 2024
+FC_DAYS_AHEAD = range(2, 8)     # prognos gjord 2..7 dagar före måldagen
+
+
+def parse_forecast_weather(payload: list[dict] | dict) -> pd.DataFrame:
+    """Svar från previous-runs-API:t -> index=(days_ahead, date, hour), en kolumn per punkt."""
+    if isinstance(payload, dict):
+        payload = [payload]
+    frames = []
+    for k in FC_DAYS_AHEAD:
+        cols = {}
+        for name, loc in zip(POINTS, payload):
+            h = loc["hourly"]
+            var = "wind_speed_100m" if name.startswith("w_") else "temperature_2m"
+            cols[name] = pd.Series(h[f"{var}_previous_day{k}"], index=pd.to_datetime(h["time"]), dtype=float)
+        df = pd.DataFrame(cols).dropna()
+        g = df.groupby([df.index.date, df.index.hour]).mean()
+        g.index.names = ["date", "hour"]
+        frames.append(pd.concat({k: g}, names=["days_ahead"]))
+    return pd.concat(frames)
+
+
+def fetch_forecast_weather(start: dt.date, end: dt.date) -> pd.DataFrame:
+    hourly = ",".join(f"{v}_previous_day{k}" for v in ("wind_speed_100m", "temperature_2m")
+                      for k in FC_DAYS_AHEAD)
+    r = _get("https://previous-runs-api.open-meteo.com/v1/forecast",
+             {**_weather_params(), "hourly": hourly,
+              "start_date": start.isoformat(), "end_date": end.isoformat()})
+    return parse_forecast_weather(r.json())
+
+
+def update_forecast_weather(path: Path, today: dt.date | None = None) -> pd.DataFrame:
+    """Väderprognoser så som de såg ut 2..7 dagar i förväg. Hämtas i block om 90 dagar."""
+    today = today or dt.date.today()
+    have = None
+    start = FC_START
+    if path.exists():
+        have = pd.read_csv(path)
+        have["date"] = pd.to_datetime(have["date"]).dt.date
+        have = have.set_index(["days_ahead", "date", "hour"])
+        start = max(have.index.get_level_values("date")) + dt.timedelta(days=1)
+    end = today - dt.timedelta(days=1)
+    parts = [] if have is None else [have]
+    while start <= end:
+        stop = min(start + dt.timedelta(days=89), end)
+        parts.append(fetch_forecast_weather(start, stop))
+        start = stop + dt.timedelta(days=1)
+    out = pd.concat(parts)
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.round(1).to_csv(path)
+    return out

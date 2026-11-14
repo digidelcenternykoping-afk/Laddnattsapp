@@ -102,3 +102,40 @@ def test_daily_forecast_json(tmp_path):
     append_log(fc, log)
     append_log(fc, log)  # samma dag två gånger ska inte ge dubbletter
     assert len(pd.read_csv(log)) == 6 * 24
+
+
+def synthetic_forecast_weather(w, seed=2):
+    """Väderprognoser = uppmätt väder plus brus som växer med antal dagar framåt."""
+    rng = np.random.default_rng(seed)
+    parts = {k: w + rng.normal(0, 0.4 * k, w.shape) for k in sources.FC_DAYS_AHEAD}
+    return pd.concat(parts, names=["days_ahead"])
+
+
+def test_parse_forecast_weather():
+    times = [f"2025-01-01T{h:02d}:00" for h in range(24)]
+    hourly = {"time": times}
+    for k in sources.FC_DAYS_AHEAD:
+        hourly[f"wind_speed_100m_previous_day{k}"] = [float(k)] * 24
+        hourly[f"temperature_2m_previous_day{k}"] = [-float(k)] * 24
+    fw = sources.parse_forecast_weather([{"hourly": hourly} for _ in sources.POINTS])
+    assert fw.loc[(3, dt.date(2025, 1, 1), 5), "w_vg"] == 3.0
+    assert fw.loc[(7, dt.date(2025, 1, 1), 5), "t_gbg"] == -7.0
+
+
+def test_training_uses_forecast_weather_for_target_day():
+    prices, w = synthetic(60)
+    fw = synthetic_forecast_weather(w)
+    a = build_training(prices, w)
+    b = build_training(prices, w, fw)
+    assert len(a) == len(b)
+    assert not np.allclose(a["wind"], b["wind"])          # måldagens väder skiljer sig
+    assert np.allclose(a["hist_windpow"], b["hist_windpow"])  # historiken är uppmätt
+
+
+def test_backtest_with_forecast_weather():
+    prices, w = synthetic()
+    pred, nights = run_backtest(prices, w, test_days=120, folds=2, max_iter=80,
+                                fc_weather=synthetic_forecast_weather(w))
+    m = nights.mean(numeric_only=True)
+    assert len(nights) > 100
+    assert m["facit"] <= m["modell"] < m["slump"]
