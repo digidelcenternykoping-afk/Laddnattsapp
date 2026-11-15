@@ -36,9 +36,11 @@ POINTS = {**WIND_POINTS, **TEMP_POINTS}
 
 def _get(url: str, params: dict | None = None, tries: int = 4) -> requests.Response | None:
     """GET med omförsök. Returnerar None vid 404."""
+    last = "inget svar"
     for i in range(tries):
         try:
             r = requests.get(url, params=params, headers=UA, timeout=60)
+            last = f"HTTP {r.status_code}: {r.text[:200]}"
             if r.status_code == 404:
                 return None
             if r.status_code == 200:
@@ -46,10 +48,10 @@ def _get(url: str, params: dict | None = None, tries: int = 4) -> requests.Respo
             if r.status_code == 429:  # för många anrop: vänta så länge tjänsten ber om
                 time.sleep(min(int(r.headers.get("Retry-After", "30") or 30), 120))
                 continue
-        except (requests.RequestException, ValueError):
-            pass
+        except (requests.RequestException, ValueError) as e:
+            last = repr(e)
         time.sleep(2 ** i)
-    raise RuntimeError(f"Kunde inte hämta {url}")
+    raise RuntimeError(f"Kunde inte hämta {url} ({last})")
 
 
 # ---------------------------------------------------------------- priser
@@ -142,8 +144,10 @@ def fetch_weather_forecast() -> pd.DataFrame:
     return parse_weather(r.json())
 
 
-def update_weather(path: Path, today: dt.date | None = None) -> pd.DataFrame:
-    """Historik från arkivet (cachas) + de senaste dagarna och prognosen från prognos-API:t."""
+def update_weather(path: Path, today: dt.date | None = None, forecast: bool = True) -> pd.DataFrame:
+    """Historik från arkivet (cachas) + de senaste dagarna och prognosen från prognos-API:t.
+
+    forecast=False hoppar över prognos-API:t (testet mot historik klarar sig utan)."""
     today = today or dt.date.today()
     hist = load_weather(path) if path.exists() else None
     start = FIRST_PRICE_DATE - dt.timedelta(days=10)
@@ -156,6 +160,8 @@ def update_weather(path: Path, today: dt.date | None = None) -> pd.DataFrame:
         hist = hist[~hist.index.duplicated(keep="last")].sort_index()
         path.parent.mkdir(parents=True, exist_ok=True)
         hist.round(1).to_csv(path)
+    if not forecast:
+        return hist
     fc = fetch_weather_forecast()
     allw = pd.concat([hist, fc]) if hist is not None else fc
     return allw[~allw.index.duplicated(keep="last")].sort_index()

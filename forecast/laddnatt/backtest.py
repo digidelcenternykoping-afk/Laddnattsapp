@@ -194,7 +194,12 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("backtest.md"))
     a = ap.parse_args()
     prices = sources.update_prices(a.data / "prices_SE3.csv")
-    weather = sources.update_weather(a.data / "weather.csv")
+    try:
+        weather = sources.update_weather(a.data / "weather.csv")
+    except RuntimeError as e:
+        # Testet behöver bara historiskt väder; de sista dagarna faller bort utan prognos-API:t.
+        print(f"Väderprognosen gick inte att hämta, testar med arkivet: {e}")
+        weather = sources.update_weather(a.data / "weather.csv", forecast=False)
     pred, nights = run_backtest(prices, weather)
     text = report(pred, nights)
     try:
