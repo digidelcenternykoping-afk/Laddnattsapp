@@ -21,9 +21,15 @@ Priserna är i SEK/kWh exklusive moms, elskatt och nätavgift.
 
 **Så räknar modellen.** Den lär sig från historiken hur priset rör sig relativt den senaste
 veckans nivå beroende på vindprognos (sex punkter i Sverige, Finland och Danmark),
-temperatur, veckodag, helgdagar och årstid. Kärnkraftsstopp, vattenmagasin, grannländernas
-priser och överföringskapacitet fångas än så länge bara indirekt via prisnivån och läggs
-till som egna indata i nästa steg.
+temperatur, veckodag, helgdagar och årstid. Grannländernas priser och överföringskapacitet
+fångas än så länge bara indirekt via prisnivån.
+
+**Kärnkraft och vattenmagasin** är testade som egna indata men inte påslagna, eftersom de
+inte gav säkert bättre val av natt i det ärliga testet (november 2025 till november 2026):
+kärnkraft gjorde valen sämre i alla fyra kvartalen, och vattenmagasin gav knappt 1 öre/kWh
+billigare nätter men sämre timpriser. Testet mot historik jämför dem på nytt vid varje
+ändring, och de slås på i `forecast/laddnatt/features.py` om de börjar hjälpa när det
+finns mer historik.
 
 **Köra själv**
 
@@ -36,6 +42,8 @@ PYTHONPATH=forecast python -m laddnatt.daily      # dagens prognos
 
 **Datakällor.** Spotpriser från [elprisetjustnu.se](https://www.elprisetjustnu.se/elpris-api).
 Väder från [Open-Meteo](https://open-meteo.com/) (CC BY 4.0).
+I testet även svensk kärnkraftsproduktion från [Energy-Charts](https://api.energy-charts.info/)
+och norska magasin från [NVE](https://www.nve.no/energi/analyser-og-statistikk/om-magasinstatistikken/).
 
 ## Android-appen
 

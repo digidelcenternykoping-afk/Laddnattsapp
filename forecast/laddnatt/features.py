@@ -17,10 +17,13 @@ import pandas as pd
 
 from .sources import TEMP_POINTS, WIND_POINTS
 
-# Vilka extra indata den dagliga prognosen använder. Bara de som förbättrade
-# det ärliga testet mot historik är påslagna (se README och backtest.py).
-USE_NUCLEAR = True
-USE_HYDRO = True
+# Vilka extra indata den dagliga prognosen använder. Bara de som förbättrar
+# det ärliga testet mot historik slås på (se README och backtest.py).
+# Test 2025-11-08 till 2026-11-07: kärnkraft gav dyrare nätter i alla fyra
+# kvartalen; vattenmagasin gav 0,007 SEK/kWh billigare nätter men större
+# medelfel per timme. Ingen av dem klarade kravet, så båda är avstängda.
+USE_NUCLEAR = False
+USE_HYDRO = False
 
 LEADS = range(1, 7)
 LEVEL_DAYS = 8  # dagar bakåt (inkl. L) som beskriver "prisnivån just nu"
