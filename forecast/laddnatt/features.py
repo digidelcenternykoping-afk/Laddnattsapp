@@ -17,6 +17,11 @@ import pandas as pd
 
 from .sources import TEMP_POINTS, WIND_POINTS
 
+# Vilka extra indata den dagliga prognosen använder. Bara de som förbättrade
+# det ärliga testet mot historik är påslagna (se README och backtest.py).
+USE_NUCLEAR = True
+USE_HYDRO = True
+
 LEADS = range(1, 7)
 LEVEL_DAYS = 8  # dagar bakåt (inkl. L) som beskriver "prisnivån just nu"
 _SE_HOLIDAYS = holidays.Sweden(include_sundays=False)
@@ -49,9 +54,62 @@ def forecast_matrices(fc_weather: pd.DataFrame) -> dict[int, dict[str, pd.DataFr
             for k in fc_weather.index.get_level_values("days_ahead").unique()}
 
 
+NUCLEAR_COLS = ["nuc_gw", "nuc_7d_gw", "nuc_change_gw"]
+HYDRO_COLS = ["hydro_fill", "hydro_vs_median", "hydro_change"]
+
+
+class MarketData:
+    """Kärnkraft och vattenmagasin så som de var kända vid prognostillfället.
+
+    Prognosen görs dag D (priser kända t.o.m. D+1). Då är kärnkraftens
+    produktion känd för hela dygn t.o.m. D-1, och NVE:s magasinsiffror för en
+    vecka publiceras onsdagen efter; vi räknar med dem först på torsdagen.
+    """
+
+    def __init__(self, nuclear: pd.Series | None = None, hydro: pd.DataFrame | None = None):
+        self.nuclear = None
+        if nuclear is not None and len(nuclear):
+            self.nuclear = {d: float(v) for d, v in nuclear.dropna().items()}
+        self.hydro = None
+        if hydro is not None and len(hydro):
+            h = hydro.copy()
+            h["available"] = [dt.date.fromisocalendar(int(y), int(w), 7) + dt.timedelta(days=4)
+                              for y, w in zip(h["iso_year"], h["iso_week"])]
+            h = h.sort_values("available").reset_index(drop=True)
+            h["change"] = h["fill"].diff()
+            self.hydro = h
+
+    @property
+    def columns(self) -> list[str]:
+        return (NUCLEAR_COLS if self.nuclear else []) + (HYDRO_COLS if self.hydro is not None else [])
+
+    def features(self, run_day: dt.date) -> dict[str, float]:
+        out: dict[str, float] = {}
+        if self.nuclear:
+            last = run_day - dt.timedelta(days=1)
+            vals = [self.nuclear.get(last - dt.timedelta(days=i)) for i in range(7)]
+            recent = next((v for v in vals[:3] if v is not None), None)  # högst några dygn gammalt
+            week = [v for v in vals if v is not None]
+            nan = float("nan")
+            out["nuc_gw"] = recent / 1000 if recent is not None else nan
+            out["nuc_7d_gw"] = np.mean(week) / 1000 if len(week) >= 4 else nan
+            out["nuc_change_gw"] = out["nuc_gw"] - out["nuc_7d_gw"]
+        if self.hydro is not None:
+            known = self.hydro[self.hydro["available"] <= run_day]
+            if len(known) and (run_day - known["available"].iloc[-1]).days <= 21:
+                r = known.iloc[-1]
+                out["hydro_fill"] = float(r["fill"])
+                out["hydro_vs_median"] = float(r["fill"] - r["median"])
+                out["hydro_change"] = float(r["change"])
+            else:
+                out.update({c: float("nan") for c in HYDRO_COLS})
+        return out
+
+
 def rows_for_origin(prices: pd.DataFrame, wm: dict[str, pd.DataFrame], last_known: dt.date,
                     with_target: bool,
-                    wm_lead: dict[int, dict[str, pd.DataFrame]] | None = None) -> pd.DataFrame | None:
+                    wm_lead: dict[int, dict[str, pd.DataFrame]] | None = None,
+                    market: MarketData | None = None) -> pd.DataFrame | None:
     """Rader för alla leads och timmar givet att priser är kända t.o.m. last_known.
 
     wm är uppmätt väder (används för de senaste dagarna). Om wm_lead anges tas
@@ -71,6 +129,8 @@ def rows_for_origin(prices: pd.DataFrame, wm: dict[str, pd.DataFrame], last_know
         "hist_temp": wm["temp"].loc[hist_days].to_numpy().mean(),
         "hist_free_share": np.mean([is_free_day(d) for d in hist_days]),
     }
+    if market is not None:
+        base.update(market.features(last_known - dt.timedelta(days=1)))
     frames = []
     for lead in LEADS:
         t = last_known + dt.timedelta(days=lead)
@@ -105,11 +165,13 @@ def rows_for_origin(prices: pd.DataFrame, wm: dict[str, pd.DataFrame], last_know
 
 
 def build_training(prices: pd.DataFrame, weather: pd.DataFrame,
-                   fc_weather: pd.DataFrame | None = None) -> pd.DataFrame:
+                   fc_weather: pd.DataFrame | None = None,
+                   market: MarketData | None = None) -> pd.DataFrame:
     wm = weather_matrices(weather)
     wm_lead = forecast_matrices(fc_weather) if fc_weather is not None else None
     frames = [r for d in prices.index
-              if (r := rows_for_origin(prices, wm, d, with_target=True, wm_lead=wm_lead)) is not None]
+              if (r := rows_for_origin(prices, wm, d, with_target=True, wm_lead=wm_lead,
+                                       market=market)) is not None]
     return pd.concat(frames, ignore_index=True)
 
 

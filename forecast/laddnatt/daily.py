@@ -11,19 +11,27 @@ import numpy as np
 import pandas as pd
 
 from . import sources
-from .features import build_training, rows_for_origin, weather_matrices
+from .features import (HYDRO_COLS, NUCLEAR_COLS, USE_HYDRO, USE_NUCLEAR, MarketData,
+                       build_training, rows_for_origin, weather_matrices)
 from .model import PriceModel
 from .nights import CHARGE_HOURS, N_NIGHTS, best_window, night_hours
 
 
 def make_forecast(prices: pd.DataFrame, weather: pd.DataFrame, now: dt.datetime,
-                  max_iter: int = 300) -> dict:
+                  max_iter: int = 300, market: MarketData | None = None) -> dict:
     last_known = max(prices.index)
-    model = PriceModel(max_iter=max_iter).fit(build_training(prices, weather))
-    rows = rows_for_origin(prices, weather_matrices(weather), last_known, with_target=False)
+    rows = rows_for_origin(prices, weather_matrices(weather), last_known, with_target=False,
+                           market=market)
     if rows is None:
         raise RuntimeError("Saknar pris- eller väderdata för de senaste dagarna")
-    pred = model.predict(rows)
+    # Saknas dagens kärnkrafts- eller magasinsvärde räknar vi utan den källan i dag.
+    drop = [c for group in (NUCLEAR_COLS, HYDRO_COLS)
+            if any(c in rows and rows[c].isna().any() for c in group) for c in group]
+    for c in drop:
+        print(f"Saknar aktuellt värde för {c}, räknar utan det")
+    train = build_training(prices, weather, market=market).drop(columns=drop, errors="ignore")
+    model = PriceModel(max_iter=max_iter).fit(train)
+    pred = model.predict(rows.drop(columns=drop, errors="ignore"))
     fc = {(r.target_date, r.hour): (r.p10, r.p50, r.p90) for r in pred.itertuples()}
 
     def hour_value(day: dt.date, h: int) -> tuple[float, float, float, bool] | None:
@@ -91,6 +99,23 @@ def append_log(forecast: dict, path: Path) -> None:
     new.to_csv(path, index=False)
 
 
+def load_market(data_dir: Path, today: dt.date | None = None,
+                use_nuclear: bool = USE_NUCLEAR, use_hydro: bool = USE_HYDRO) -> MarketData:
+    """Kärnkraft och vattenmagasin. Svarar inte en källa körs prognosen utan den."""
+    nuclear = hydro = None
+    if use_nuclear:
+        try:
+            nuclear = sources.update_nuclear(data_dir / "nuclear_SE.csv", today)
+        except Exception as e:
+            print(f"Kunde inte hämta kärnkraftsdata, räknar utan: {e}")
+    if use_hydro:
+        try:
+            hydro = sources.update_hydro(data_dir / "hydro_NO.csv")
+        except Exception as e:
+            print(f"Kunde inte hämta magasinsdata, räknar utan: {e}")
+    return MarketData(nuclear, hydro)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=Path, default=Path("data"))
@@ -99,7 +124,7 @@ def main() -> None:
     now = dt.datetime.now(ZoneInfo(sources.TZ))
     prices = sources.update_prices(a.data / "prices_SE3.csv", now.date())
     weather = sources.update_weather(a.data / "weather.csv", now.date())
-    forecast = make_forecast(prices, weather, now)
+    forecast = make_forecast(prices, weather, now, market=load_market(a.data, now.date()))
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(forecast, ensure_ascii=False, indent=1), encoding="utf-8")
     append_log(forecast, a.data / "forecast_log.csv")

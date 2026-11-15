@@ -1,4 +1,5 @@
-"""Datahämtning: spotpriser (elprisetjustnu.se) och väder (Open-Meteo).
+"""Datahämtning: spotpriser (elprisetjustnu.se), väder (Open-Meteo), svensk
+kärnkraftsproduktion (Energy-Charts) och norska vattenmagasin (NVE).
 
 Allt cachas som CSV i data/ så att den dagliga körningen bara hämtar nya dagar.
 """
@@ -42,7 +43,10 @@ def _get(url: str, params: dict | None = None, tries: int = 4) -> requests.Respo
                 return None
             if r.status_code == 200:
                 return r
-        except requests.RequestException:
+            if r.status_code == 429:  # för många anrop: vänta så länge tjänsten ber om
+                time.sleep(min(int(r.headers.get("Retry-After", "30") or 30), 120))
+                continue
+        except (requests.RequestException, ValueError):
             pass
         time.sleep(2 ** i)
     raise RuntimeError(f"Kunde inte hämta {url}")
@@ -217,3 +221,114 @@ def update_forecast_weather(path: Path, today: dt.date | None = None) -> pd.Data
     path.parent.mkdir(parents=True, exist_ok=True)
     out.round(1).to_csv(path)
     return out
+
+
+# ---------------------------------------------------------------- kärnkraft
+
+NUCLEAR_URL = "https://api.energy-charts.info/public_power"
+NUCLEAR_START = dt.date(2022, 10, 1)
+NUCLEAR_PAUSE = 31  # Energy-Charts tillåter ca två anrop per minut
+
+
+def parse_nuclear(payload: dict) -> pd.Series:
+    """Energy-Charts public_power (v1 eller v2) -> kärnkraft i MW per dygn (svenskt datum).
+
+    Dygn där mer än en tiondel av värdena saknas tas inte med, så att ett
+    halvfärdigt dygn inte ser ut som ett kärnkraftsstopp.
+    """
+    if "unix_seconds" in payload:  # v1: kolumner
+        t = pd.to_datetime(payload["unix_seconds"], unit="s", utc=True)
+        vals = next((pt["data"] for pt in payload.get("production_types", [])
+                     if "nuclear" in str(pt.get("name", "")).lower()), None)
+    else:  # v2: en post per tidpunkt
+        ids = [s["id"] for s in payload.get("series", []) if "nuclear" in str(s.get("id", "")).lower()]
+        rows = payload.get("data", [])
+        t = pd.to_datetime([r["timestamp"] for r in rows], utc=True)
+        vals = [r["values"].get(ids[0]) for r in rows] if ids else None
+    if vals is None or len(t) == 0:
+        return pd.Series(dtype=float, name="nuclear_mw")
+    s = pd.Series(vals, index=t.tz_convert(TZ), dtype=float).sort_index()
+    step = pd.Series(s.index).diff().median()
+    expected = pd.Timedelta(days=1) / step if pd.notna(step) and step > pd.Timedelta(0) else 24
+    days = s.index.date
+    mean = s.groupby(days).mean()
+    count = s.notna().groupby(days).sum()
+    out = mean[count >= 0.9 * expected].dropna()
+    out.index.name = "date"
+    return out.rename("nuclear_mw")
+
+
+def fetch_nuclear(start: dt.date, end: dt.date) -> pd.Series:
+    r = _get(NUCLEAR_URL, {"country": "se", "start": start.isoformat(), "end": end.isoformat()})
+    return parse_nuclear(r.json()) if r is not None else pd.Series(dtype=float, name="nuclear_mw")
+
+
+def load_nuclear(path: Path) -> pd.Series:
+    df = pd.read_csv(path)
+    df["date"] = pd.to_datetime(df["date"]).dt.date
+    return df.set_index("date")["nuclear_mw"]
+
+
+def update_nuclear(path: Path, today: dt.date | None = None) -> pd.Series:
+    """Svensk kärnkraftsproduktion per dygn. Hämtar bara dygn som saknas, i block om ett år."""
+    today = today or dt.date.today()
+    have = load_nuclear(path) if path.exists() else pd.Series(dtype=float, name="nuclear_mw")
+    start = NUCLEAR_START
+    if len(have):
+        start = max(have.index) - dt.timedelta(days=2)  # de sista dygnen kan ha kompletterats
+    parts = [have]
+    first = True
+    while start <= today:
+        stop = min(start + dt.timedelta(days=364), today)
+        if not first:
+            time.sleep(NUCLEAR_PAUSE)
+        first = False
+        parts.append(fetch_nuclear(start, stop + dt.timedelta(days=1)))
+        start = stop + dt.timedelta(days=1)
+    out = pd.concat(parts)
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    out = out[[d < today for d in out.index]]  # dagens dygn är inte komplett
+    out.index.name = "date"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    out.round(0).to_csv(path)
+    return out
+
+
+# ---------------------------------------------------------------- vattenmagasin
+
+HYDRO_URL = "https://biapi.nve.no/magasinstatistikk/api/Magasinstatistikk"
+
+
+def parse_hydro(data: list[dict], median: list[dict]) -> pd.DataFrame:
+    """NVE:s magasinstatistikk för hela Norge -> en rad per vecka.
+
+    Kolumner: iso_year, iso_week, fill (fyllnadsgrad 0-1) och median (medianen
+    för samma vecka de senaste tjugo åren).
+    """
+    rows = [r for r in data if r.get("omrType") == "NO"]
+    df = pd.DataFrame(rows)[["iso_aar", "iso_uke", "fyllingsgrad"]]
+    df.columns = ["iso_year", "iso_week", "fill"]
+    med = pd.DataFrame([r for r in median if r.get("omrType") == "NO"])
+    med = med.groupby("iso_uke")["medianFyllingsGrad"].mean()
+    df["median"] = df["iso_week"].map(med)
+    df = df.dropna(subset=["fill"]).drop_duplicates(["iso_year", "iso_week"], keep="last")
+    return df.sort_values(["iso_year", "iso_week"]).reset_index(drop=True)
+
+
+def fetch_hydro() -> pd.DataFrame:
+    data = _get(f"{HYDRO_URL}/HentOffentligData").json()
+    median = _get(f"{HYDRO_URL}/HentOffentligDataMinMaxMedian").json()
+    return parse_hydro(data, median)
+
+
+def load_hydro(path: Path) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+def update_hydro(path: Path) -> pd.DataFrame:
+    """Hela serien är liten, så den hämtas om varje gång och sparas i data/."""
+    df = fetch_hydro()
+    df = df[df["iso_year"] >= 2020]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.round(4).to_csv(path, index=False)
+    return df
