@@ -139,3 +139,105 @@ def test_backtest_with_forecast_weather():
     m = nights.mean(numeric_only=True)
     assert len(nights) > 100
     assert m["facit"] <= m["modell"] < m["slump"]
+
+
+# ---------------------------------------------------------------- kärnkraft och vattenmagasin
+
+from laddnatt.backtest import VARIANTS, compare_report, prepare, summarize  # noqa: E402
+from laddnatt.features import HYDRO_COLS, NUCLEAR_COLS, MarketData  # noqa: E402
+
+
+def test_parse_nuclear_v1_and_v2():
+    t = pd.date_range("2025-01-01", periods=48, freq="h", tz="Europe/Stockholm")
+    v1 = {"unix_seconds": [int(x.timestamp()) for x in t],
+          "production_types": [{"name": "Wind onshore", "data": [1.0] * 48},
+                               {"name": "Nuclear", "data": [6000.0] * 24 + [5000.0] * 12 + [None] * 12}]}
+    s = sources.parse_nuclear(v1)
+    assert s[dt.date(2025, 1, 1)] == 6000.0
+    assert dt.date(2025, 1, 2) not in s.index  # halva dygnet saknas
+    v2 = {"series": [{"id": "nuclear", "name": "Nuclear"}],
+          "data": [{"timestamp": x.isoformat(), "values": {"nuclear": 4000.0}} for x in t]}
+    s2 = sources.parse_nuclear(v2)
+    assert list(s2) == [4000.0, 4000.0]
+
+
+def test_parse_hydro():
+    data = [{"omrType": "NO", "omrnr": 0, "iso_aar": 2025, "iso_uke": w, "fyllingsgrad": 0.5 + w / 100}
+            for w in (1, 2)] + [{"omrType": "EL", "omrnr": 1, "iso_aar": 2025, "iso_uke": 1, "fyllingsgrad": 0.1}]
+    median = [{"omrType": "NO", "omrnr": 0, "iso_uke": w, "medianFyllingsGrad": 0.5} for w in (1, 2)]
+    h = sources.parse_hydro(data, median)
+    assert len(h) == 2 and h["fill"].tolist() == [0.51, 0.52] and h["median"].tolist() == [0.5, 0.5]
+
+
+def test_market_data_uses_only_what_was_known():
+    d0 = dt.date(2025, 1, 1)
+    nuclear = pd.Series({d0 + dt.timedelta(days=i): 1000.0 * i for i in range(30)})
+    hydro = pd.DataFrame({"iso_year": [2025] * 3, "iso_week": [1, 2, 3],
+                          "fill": [0.6, 0.55, 0.5], "median": [0.6, 0.6, 0.6]})
+    m = MarketData(nuclear, hydro)
+    run_day = dt.date(2025, 1, 20)  # måndag vecka 4
+    f = m.features(run_day)
+    assert f["nuc_gw"] == 18.0  # gårdagens dygn, inte dagens
+    # Vecka 3 slutar söndag 19 januari och räknas som känd först torsdag 23 januari.
+    assert f["hydro_fill"] == 0.55 and abs(f["hydro_change"] + 0.05) < 1e-9
+    assert m.features(dt.date(2025, 1, 23))["hydro_fill"] == 0.5
+    assert np.isnan(MarketData(nuclear, hydro).features(dt.date(2025, 3, 1))["nuc_gw"])
+
+
+def synthetic_market(prices, seed=3):
+    """Kärnkraft som ibland står still i flera veckor och då höjer priset."""
+    rng = np.random.default_rng(seed)
+    days = sorted(prices.index)
+    nuc = np.full(len(days), 6500.0)
+    for start in rng.choice(len(days) - 40, 6, replace=False):
+        nuc[start:start + 25] -= 2500
+    nuclear = pd.Series(nuc + rng.normal(0, 100, len(days)), index=days)
+    p = prices.copy()
+    for i, d in enumerate(days):
+        if i >= 1:
+            p.loc[d] += 0.0001 * (6500 - nuc[i - 1])
+    weeks = sorted({d.isocalendar()[:2] for d in days})
+    hydro = pd.DataFrame({"iso_year": [y for y, _ in weeks], "iso_week": [w for _, w in weeks],
+                          "fill": 0.6 + 0.1 * np.sin(np.arange(len(weeks)) / 8), "median": 0.6})
+    return p, MarketData(nuclear, hydro)
+
+
+def test_backtest_compares_variants_on_same_days():
+    prices, w = synthetic()
+    prices, market = synthetic_market(prices)
+    data = prepare(prices, w, market=market)
+    assert set(NUCLEAR_COLS + HYDRO_COLS) <= set(data.columns)
+    results = {}
+    for name, exclude in VARIANTS.items():
+        pred, nights = run_backtest(prices, w, test_days=120, folds=2, max_iter=80,
+                                    data=data, exclude=exclude)
+        results[name] = summarize(pred, nights, folds=2)
+        results[name]["days"] = len(nights)
+    assert len({r["days"] for r in results.values()}) == 1
+    # Priserna beror på kärnkraften här, så den ska hjälpa.
+    assert results["+ kärnkraft"]["mae"] < results["Nuvarande modell"]["mae"]
+    assert "Nuvarande modell" in compare_report(results, "test")
+
+
+def test_daily_forecast_with_market_keeps_format():
+    prices, w = synthetic(200)
+    prices, market = synthetic_market(prices)
+    last = max(prices.index)
+    now = dt.datetime.combine(last - dt.timedelta(days=1), dt.time(13, 40))
+    plain = make_forecast(prices, w, now, max_iter=40)
+    fc = make_forecast(prices, w, now, max_iter=40, market=market)
+    assert fc.keys() == plain.keys()
+    assert [n.keys() for n in fc["nights"]] == [n.keys() for n in plain["nights"]]
+    assert [h.keys() for h in fc["hours"]] == [h.keys() for h in plain["hours"]]
+    assert len(fc["nights"]) == 7
+
+
+def test_daily_forecast_without_recent_market_values():
+    prices, w = synthetic(200)
+    _, market = synthetic_market(prices)
+    last = max(prices.index)
+    old = {d: v for d, v in market.nuclear.items() if d < last - dt.timedelta(days=20)}
+    stale = MarketData(pd.Series(old), market.hydro[["iso_year", "iso_week", "fill", "median"]])
+    now = dt.datetime.combine(last - dt.timedelta(days=1), dt.time(13, 40))
+    fc = make_forecast(prices, w, now, max_iter=40, market=stale)
+    assert len(fc["nights"]) == 7
